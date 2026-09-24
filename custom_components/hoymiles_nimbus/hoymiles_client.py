@@ -1,5 +1,6 @@
 import datetime
 import requests
+import threading
 import yaml
 import logging
 import hashlib
@@ -18,6 +19,7 @@ except ImportError:
     from parsers import ProtobufParser
 
 _LOGGER = logging.getLogger(__name__)
+_CACHE_LOCK = threading.RLock()
 
 
 class HoymilesClient:
@@ -146,7 +148,7 @@ class HoymilesClient:
       passwordHash = hashlib.md5(password)
       return passwordHash.hexdigest()
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def get_token(self,username, password):
       payload = {
           "user_name": username,
@@ -172,7 +174,7 @@ class HoymilesClient:
     # DATA FETCHING METHODS
     # ============================================================================
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def select_by_station(self, station_id):
         """Select microinverters by station ID."""
         payload = {
@@ -185,7 +187,7 @@ class HoymilesClient:
 
         return response.get("data", {})
     
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def micro_find(self, micro_id, station_id):
         """Find a microinverter by its ID."""
         payload = {
@@ -195,7 +197,7 @@ class HoymilesClient:
         response = self._post_request(self.uris['micro_find'], payload=payload)
         return response.get('data', {})
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def module_details(self, station_id, micro_id, micro_sn, port, time):
         """Retrieve module details by its ID."""
         payload = {
@@ -210,12 +212,12 @@ class HoymilesClient:
         response = self._post_request(self.uris['module_details'], payload=payload)
         return response.get('data', {})
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def get_user_info(self):
         """Retrieve user information from Hoymiles S-Cloud. [UNUSED]"""
         return self._post_request(self.uris['user_info'])
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def select_by_page(self, type):
         uri_map = {
             "station":  "pvm/api/0/station/select_by_page",
@@ -237,7 +239,7 @@ class HoymilesClient:
 
         return response.get("data", {}).get("list", [])
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def count_station_real_data(self,id):
         """Get the count of station real data."""
         _LOGGER.debug(f"Getting count of station real data for ID: {id}")
@@ -246,7 +248,7 @@ class HoymilesClient:
         }
         return self._post_request(self.uris['count_station_data'], payload=payload)
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def findStation(self, sid):
         """Find a station by its ID."""
         payload = {
@@ -264,7 +266,7 @@ class HoymilesClient:
         response = self._post_request(self.uris['down_module_day_data'], payload=payload, response_type='protobuf', binary=True)
         return response
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def select_device_of_tree(self, station_id):
         """Get device tree for a station including DTU and microinverters."""
         payload = {
@@ -333,7 +335,7 @@ class HoymilesClient:
     # SYSTEM MAPPING AND DATA PROCESSING
     # ============================================================================
     
-    @cached(cache=TTLCache(maxsize=100, ttl=300))
+    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def map_system(self):
         """Build a hierarchical system map of stations, microinverters, and modules."""
         stations = self.select_by_page("station")
