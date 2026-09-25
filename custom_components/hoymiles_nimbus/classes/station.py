@@ -33,7 +33,7 @@ class Station:
             return
         
         if len(tree) < 3:
-            _LOGGER.warning("Data format for station ID %s is unexpected: %s", self.station_id, tree)
+            _LOGGER.debug("Data format for station ID %s is unexpected: %s", self.station_id, tree)
             return
 
         for micro_data in tree[2:]:
