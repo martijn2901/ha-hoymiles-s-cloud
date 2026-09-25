@@ -1,7 +1,6 @@
 # custom_components/hoymiles_cloud/sensor.py
 
 import logging
-import asyncio
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfElectricPotential, UnitOfElectricCurrent
 
@@ -21,36 +20,21 @@ class HoymilesSystemCoordinator:
         self._client = client
         self._system = initial_system
         self._last_update = None
-        self._update_lock = asyncio.Lock()
         
     async def get_system(self):
         """Get the current system data, updating if needed."""
         import datetime
-    
         now = datetime.datetime.now()
-    
-        if (
-            self._last_update is None
-            or (now - self._last_update).total_seconds() > 30
-        ):
-            async with self._update_lock:
-                # Check again after waiting for another refresh to finish.
-                now = datetime.datetime.now()
-    
-                if (
-                    self._last_update is None
-                    or (now - self._last_update).total_seconds() > 30
-                ):
-                    self._system = await self._hass.async_add_executor_job(
-                        self._client.map_system
-                    )
-                    await self._hass.async_add_executor_job(
-                        self._client.fill_system_data,
-                        self._system,
-                    )
-                    self._last_update = now
-    
-    return self._system
+        
+        # Update every 30 seconds to avoid too frequent API calls
+        if (self._last_update is None or 
+            (now - self._last_update).total_seconds() > 30):
+            
+            self._system = await self._hass.async_add_executor_job(self._client.map_system)
+            await self._hass.async_add_executor_job(self._client.fill_system_data, self._system)
+            self._last_update = now
+            
+        return self._system
     
     def find_module(self, station_id, module_id):
         """Find a specific module in the system."""
