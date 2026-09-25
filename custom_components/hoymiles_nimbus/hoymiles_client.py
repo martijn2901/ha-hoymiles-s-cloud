@@ -237,8 +237,25 @@ class HoymilesClient:
         }
         response = self._post_request(uri, payload=payload)
 
-        return response.get("data", {}).get("list", [])
-
+        if not isinstance(response, dict):
+            _LOGGER.warning(
+                "Unexpected response from Hoymiles station API: %r",
+                response,
+            )
+            return []
+        
+        data = response.get("data")
+        
+        if not isinstance(data, dict):
+            _LOGGER.warning(
+                "Unexpected station data format from Hoymiles API: %r",
+                data,
+            )
+            return []
+        
+        return data.get("list", [])
+        
+    
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def count_station_real_data(self,id):
         """Get the count of station real data."""
@@ -335,7 +352,7 @@ class HoymilesClient:
     # SYSTEM MAPPING AND DATA PROCESSING
     # ============================================================================
     
-    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
+
     def map_system(self):
         """Build a hierarchical system map of stations, microinverters, and modules."""
         stations = self.select_by_page("station")
