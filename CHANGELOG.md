@@ -2,6 +2,98 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-09-28
+
+### Security
+- The `Authorization` header (session token) is no longer written to the debug log.
+- Removed the unused `get_token` helper, which logged the password hash at debug level.
+
+### Removed
+- Dead code from the old panel pipeline: `down_module_day_data`, the positional
+  `ProtobufParser`, `classes/`, `map_system`/`fill_system_data` and the old panel sensor classes.
+
+### Added
+- Test suite in `tests/` (login, protobuf parsing, panel/inverter sensors, options, setup).
+
+## [0.6.2] - 2026-09-28
+
+### Fixed
+- Panel current showed "unknown": power, voltage and current come from separate
+  requests whose time axes can differ, and values were matched by position.
+  Each quota is now matched on the timestamp of the latest power slot.
+- When the API has no current for that slot, current is calculated as power / voltage
+  (the sensor then has the attribute `calculated: power / voltage`).
+
+## [0.6.1] - 2026-09-28
+
+### Fixed
+- Panel sensors stuck at 0 W: `module/data/count_by_day` returns an empty body when
+  several quotas are requested together. Power, voltage and current are now requested
+  one at a time and merged. An empty answer is logged as a warning.
+- The requested date is used when a response does not carry one.
+
+## [0.6.0] - 2026-09-28
+
+### Fixed
+- **Panel sensors reported thousands of watts at night.** The old panel data came from
+  `down_module_day_data` through a positional protobuf guess: when power was 0 the field
+  was omitted and the panel's daily energy (Wh) ended up in the power slot (e.g. "3,342 W").
+  Panels now use `pvm-data/api/0/module/data/count_by_day` (the call the website uses),
+  decoded by field number. Same unique IDs, so entities and dashboards carry over.
+- Values from a slot older than 40 minutes or from another day are treated as "not producing"
+  (power 0 W, voltage/current unknown) instead of repeating the last reading.
+
+### Changed
+- Panel data is fetched by the same coordinator as the microinverters (one refresh interval).
+- Microinverter AC power reads 0 W (not unknown) while the inverter sleeps.
+- Panel sensors expose `microinverter`, `port`, `position_x`, `position_y` and `data_time`.
+
+## [0.5.1] - 2026-09-28
+
+### Fixed
+- Microinverter values are rounded to 2 decimals (the API sends float32 values such as 269.799987 V).
+
+## [0.5.0] - 2026-09-28
+
+### Added
+- **Refresh interval option** (Configure → Refresh interval, 5-60 min, default 5).
+  One setting for station, panel and microinverter sensors; changing it reloads the integration.
+- UI labels for the setup and options forms (`translations/en.json`).
+
+### Changed
+- Panel data was re-downloaded every 30 s; it now follows the refresh interval.
+- Station data (power, today, total) is cached for the refresh interval instead of a fixed 5 min.
+- Options form only re-validates the login when credentials actually change.
+
+## [0.4.1] - 2026-09-27
+
+### Fixed
+- **Login for current S-Cloud accounts**: uses the v3 login the website uses
+  (`pre-insp` + Argon2id or unsalted hash + nonce), trying the web and then the
+  S-Miles Installer identity, with the old v0 MD5 login as a last fallback.
+  Accounts that only accept the new login used to fail with `cannot_connect`.
+- The real login error is now written to the Home Assistant log.
+
+### Changed
+- Added `argon2-cffi` requirement.
+
+## [0.4.0] - 2026-09-27
+
+### Added
+- **Per-microinverter sensors** (one device per inverter, linked to the station):
+  - Grid Voltage (V), with `min_today` / `max_today` attributes
+  - Grid Frequency (Hz)
+  - Temperature (°C)
+  - AC Power (W)
+  - Grid Voltage Max Today (V)
+  - Production Dropouts Today: 5-minute slots where the inverter had grid voltage and
+    produced before and after, but reported 0 W (typical of grid-protection trips)
+- Data comes from `pvm-data/api/0/micro/data/count_by_day` (protobuf, `pb_ver: 1`),
+  the same call the S-Cloud web UI uses for the "Grid Voltage / Grid Frequency /
+  Temperature" charts. Polled every 5 minutes; values are `unknown` while the
+  inverters sleep.
+- Automatic re-login and retry when the token has expired.
+
 ## [0.3.0] - 2026-03-23
 
 ### Added

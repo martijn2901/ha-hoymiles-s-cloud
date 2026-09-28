@@ -1,3 +1,5 @@
+import base64
+import binascii
 import datetime
 import requests
 import threading
@@ -8,18 +10,17 @@ from cachetools import TTLCache, cached
 
 # Handle imports for both standalone and Home Assistant contexts
 try:
-    from .classes.micro_inverter import Microinverter
-    from .classes.solar_module import SolarModule
-    from .classes.station import Station
-    from .parsers import ProtobufParser
+    from .micro_data import ALL_QUOTAS, MODULE_QUOTAS, parse_count_by_day, parse_module_count_by_day
 except ImportError:
-    from classes.micro_inverter import Microinverter
-    from classes.solar_module import SolarModule
-    from classes.station import Station
-    from parsers import ProtobufParser
+    from micro_data import ALL_QUOTAS, MODULE_QUOTAS, parse_count_by_day, parse_module_count_by_day
 
 _LOGGER = logging.getLogger(__name__)
 _CACHE_LOCK = threading.RLock()
+
+
+def _redact(headers):
+    """Copy of the headers that is safe to log (no session token)."""
+    return {k: ("***" if k.lower() == "authorization" else v) for k, v in (headers or {}).items()}
 
 
 class HoymilesClient:
@@ -51,15 +52,18 @@ class HoymilesClient:
             "find": "pvm/api/0/station/find",
             "select_by_station": "pvm/api/0/dev/micro/select_by_station",
             "micro_find": "pvm/api/0/dev/micro/find",
-            "module_details": "pvm-data/api/0/module/data/find_details",
             "select_all_arrays": "pvm/api/0/dev/array_v3/select_all",
-            "down_module_day_data": "pvm-data/api/0/module/data/down_module_day_data",
             "down_station_day_data": "pvm-data/api/0/station/down_station_day_data",
             "select_device_of_tree": "pvm/api/0/station/select_device_of_tree",
+            "micro_count_by_day": "pvm-data/api/0/micro/data/count_by_day",
+            "module_count_by_day": "pvm-data/api/0/module/data/count_by_day",
         }
         
         self.token = None
         self.cache = TTLCache(maxsize=100, ttl=300)
+        # Refresh interval shared by all sensors (seconds); set from the options.
+        self.scan_interval_s = 300
+        self._station_cache = {}
 
     # ============================================================================
     # HTTP HELPER METHODS
@@ -71,6 +75,8 @@ class HoymilesClient:
         url = f"{self.base_url}{uri}"
         if headers is None:
             headers = {"Content-Type": "application/json"}
+        for k, v in getattr(self, "_extra_headers", {}).items():
+            headers.setdefault(k, v)
         if use_auth:
             if self.token:
                 headers["Authorization"] = self.token
@@ -79,7 +85,7 @@ class HoymilesClient:
 
         _LOGGER.debug(f"POST Request URL: {url}")
         _LOGGER.debug(f"POST Request Payload: {payload}")
-        _LOGGER.debug(f"POST Request Headers: {headers}")
+        _LOGGER.debug("POST Request Headers: %s", _redact(headers))
         
         response = requests.post(url, json=payload, headers=headers)
         
@@ -90,10 +96,8 @@ class HoymilesClient:
             
             # Attempt to parse the response as JSON
             try:
-                if response_type == 'protobuf' and binary:
-                    parser = ProtobufParser(response.content)
-                    _LOGGER.debug("API Response: %s - Protobuf data received", response.status_code)
-                    return parser
+                if response_type == 'raw':
+                    return response.content
                 response_data = response.json()
                 logging.debug(f"Response JSON: {response_data}")
                 _LOGGER.debug("API Response: %s - Success", response.status_code)
@@ -116,6 +120,8 @@ class HoymilesClient:
         url = f"{self.base_url}{uri}"
         if headers is None:
             headers = {"Content-Type": "application/json"}
+        for k, v in getattr(self, "_extra_headers", {}).items():
+            headers.setdefault(k, v)
         if self.token:
             headers["Authorization"] = self.token
         else:
@@ -123,7 +129,7 @@ class HoymilesClient:
 
         _LOGGER.debug(f"PUT Request URL: {url}")
         _LOGGER.debug(f"PUT Request Payload: {payload}")
-        _LOGGER.debug(f"PUT Request Headers: {headers}")
+        _LOGGER.debug("PUT Request Headers: %s", _redact(headers))
 
         response = requests.post(url, json=payload, headers=headers)
         response.raise_for_status()
@@ -148,27 +154,138 @@ class HoymilesClient:
       passwordHash = hashlib.md5(password)
       return passwordHash.hexdigest()
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
-    def get_token(self,username, password):
-      payload = {
-          "user_name": username,
-          "password": password,
-      }
-      _LOGGER.debug(f"Payload for get_token: {payload}")
-      return self._post_request(self.uris['login'], payload=payload, use_auth=False)
-    
+    # Client identities accepted by the v3 login. "web" mimics the S-Cloud
+    # website; "installer" mimics the S-Miles Installer app (some owner accounts
+    # created by an installer only accept this one).
+    _AUTH_PROFILES = {
+        "web": {"User-Agent": "HomeAssistant-HoymilesNimbus"},
+        "installer": {
+            "User-Agent": "S-Miles Installer/3.7.1",
+            "App-Version": "3.7.1",
+            "X-App-Version": "3.7.1",
+            "X-Client-Type": "mobile",
+        },
+    }
+
+    def _auth_post(self, path, payload, extra_headers):
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers.update(extra_headers)
+        url = f"{self.base_url.rstrip('/')}/{path.lstrip('/')}"
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        try:
+            return response.json()
+        except ValueError:
+            return {"status": str(response.status_code), "message": response.text[:200]}
+
+    @staticmethod
+    def _unwrap_pre_insp(resp):
+        if isinstance(resp, dict) and ("status" in resp or "data" in resp):
+            data = resp.get("data")
+            return str(resp.get("status")), resp.get("message"), data if isinstance(data, dict) else {}
+        if isinstance(resp, dict) and any(k in resp for k in ("a", "n", "u")):
+            return "0", "success", resp
+        return None, (resp or {}).get("message") if isinstance(resp, dict) else None, {}
+
+    @staticmethod
+    def _decode_salt(value):
+        value = value.strip()
+        try:
+            if len(value) % 2 == 0:
+                return bytes.fromhex(value)
+        except ValueError:
+            pass
+        try:
+            return base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError):
+            return value.encode()
+
+    def _login_v3(self, profile):
+        """Browser/app login: pre-insp (salt + nonce) then login with a credential hash.
+
+        Returns (token, error_message).
+        """
+        extra = self._AUTH_PROFILES[profile]
+        pre = self._auth_post("iam/pub/3/auth/pre-insp", {"u": self.username}, extra)
+        status, message, data = self._unwrap_pre_insp(pre)
+        if status not in (None, "0") or not data.get("n"):
+            return None, f"pre-insp: status={status} message={message}"
+
+        salt = data.get("a")
+        if salt:
+            try:
+                from argon2.low_level import Type, hash_secret_raw
+            except ImportError:
+                return None, "account needs Argon2 login but argon2-cffi is not installed"
+            raw = hash_secret_raw(
+                secret=self.password.encode(), salt=self._decode_salt(salt),
+                time_cost=3, memory_cost=32768, parallelism=1, hash_len=32, type=Type.ID,
+            )
+            candidates = [("argon2", raw.hex())]
+        else:
+            md5_hex = hashlib.md5(self.password.encode()).hexdigest()
+            sha = hashlib.sha256(self.password.encode())
+            candidates = [
+                ("md5.sha256b64", f"{md5_hex}.{base64.b64encode(sha.digest()).decode()}"),
+                ("sha256hex", sha.hexdigest()),
+            ]
+
+        nonce = data["n"]
+        last = None
+        for i, (variant, ch) in enumerate(candidates):
+            if i > 0:  # every attempt needs a fresh nonce
+                status, message, data = self._unwrap_pre_insp(
+                    self._auth_post("iam/pub/3/auth/pre-insp", {"u": self.username}, extra))
+                if not data.get("n"):
+                    break
+                nonce = data["n"]
+            resp = self._auth_post("iam/pub/3/auth/login", {"u": self.username, "ch": ch, "n": nonce}, extra)
+            token = (resp.get("data") or {}).get("token") if isinstance(resp, dict) else None
+            if str(resp.get("status")) == "0" and token:
+                _LOGGER.info("Hoymiles login OK (v3, %s profile, %s hash)", profile, variant)
+                return token, None
+            last = f"login {variant}: status={resp.get('status')} message={resp.get('message')}"
+        return None, last
+
+    def _login_v0(self):
+        resp = self._auth_post("iam/pub/0/auth/login",
+                               {"user_name": self.username, "password": self.get_password_hash()},
+                               self._AUTH_PROFILES["web"])
+        token = (resp.get("data") or {}).get("token") if isinstance(resp, dict) else None
+        if str(resp.get("status")) == "0" and token:
+            _LOGGER.info("Hoymiles login OK (legacy v0)")
+            return token, None
+        return None, f"status={resp.get('status')} message={resp.get('message')}"
 
     def login(self):
-      """Authenticate with Hoymiles S-Cloud and retrieve a token."""
-      _LOGGER.warning("Logging into Hoymiles S-Cloud for user: %s", self.username)
-      response_data = self.get_token(username=self.username, password=self.get_password_hash())
-      if response_data and "data" in response_data and "token" in response_data["data"]:
-          self.token = response_data["data"]["token"]
-          _LOGGER.warning("Successfully authenticated with Hoymiles S-Cloud")
-          return True
-      else:
-          _LOGGER.error("Login failed: Token not found in response")
-          raise Exception("Login failed: Token not found in response")
+        """Authenticate with Hoymiles S-Cloud and retrieve a token.
+
+        Tries the current v3 login (web, then installer identity) and falls back
+        to the legacy v0 MD5 login.
+        """
+        _LOGGER.debug("Logging into Hoymiles S-Cloud for user: %s", self.username)
+        errors = []
+        for profile in ("web", "installer"):
+            try:
+                token, err = self._login_v3(profile)
+            except Exception as ex:  # noqa: BLE001
+                token, err = None, str(ex)
+            if token:
+                self.token = token
+                self._extra_headers = dict(self._AUTH_PROFILES[profile])
+                return True
+            errors.append(f"v3/{profile}: {err}")
+        try:
+            token, err = self._login_v0()
+        except Exception as ex:  # noqa: BLE001
+            token, err = None, str(ex)
+        if token:
+            self.token = token
+            self._extra_headers = dict(self._AUTH_PROFILES["web"])
+            return True
+        errors.append(f"v0: {err}")
+        summary = " | ".join(errors)
+        _LOGGER.error("Hoymiles login failed: %s", summary)
+        raise Exception(f"Login failed: {summary}")
 
     # ============================================================================
     # DATA FETCHING METHODS
@@ -195,21 +312,6 @@ class HoymilesClient:
             "sid": station_id,
         }
         response = self._post_request(self.uris['micro_find'], payload=payload)
-        return response.get('data', {})
-
-    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
-    def module_details(self, station_id, micro_id, micro_sn, port, time):
-        """Retrieve module details by its ID."""
-        payload = {
-            "sid": station_id,
-            "mi_id": micro_id,
-            "mi_sn": micro_sn,
-            "port": port,
-            "time": time,
-            "warn_code": 1,
-        }
-
-        response = self._post_request(self.uris['module_details'], payload=payload)
         return response.get('data', {})
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
@@ -256,14 +358,18 @@ class HoymilesClient:
         return data.get("list", [])
         
     
-    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
-    def count_station_real_data(self,id):
-        """Get the count of station real data."""
+    def count_station_real_data(self, id):
+        """Station totals (power, today/total energy). Cached for the refresh interval."""
+        import time
+        with _CACHE_LOCK:
+            hit = self._station_cache.get(id)
+            if hit and time.monotonic() - hit[0] < self.scan_interval_s:
+                return hit[1]
         _LOGGER.debug(f"Getting count of station real data for ID: {id}")
-        payload = {
-            "sid": id,
-        }
-        return self._post_request(self.uris['count_station_data'], payload=payload)
+        data = self._post_request(self.uris['count_station_data'], payload={"sid": id})
+        with _CACHE_LOCK:
+            self._station_cache[id] = (time.monotonic(), data)
+        return data
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def findStation(self, sid):
@@ -274,14 +380,71 @@ class HoymilesClient:
         response = self._post_request(self.uris['find'], payload=payload)
         return response.get('data', {})
 
-    def down_module_day_data(self, sid, date):
-        """Download module day data for a specific date."""
+    def micro_count_by_day(self, sid, date, micro_ids, quotas=None):
+        """Per-microinverter day series: AC power, grid voltage, grid frequency, temperature.
+
+        Returns a MicroDaySeries (see micro_data.py). Retries once with a fresh
+        login if the token has expired.
+        """
         payload = {
             "sid": sid,
             "date": date,
+            "mi_list": list(micro_ids),
+            "quota": quotas or ALL_QUOTAS,
+            "pb_ver": 1,
         }
-        response = self._post_request(self.uris['down_module_day_data'], payload=payload, response_type='protobuf', binary=True)
-        return response
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"}
+        try:
+            content = self._post_request(self.uris['micro_count_by_day'], payload=payload,
+                                         headers=dict(headers), response_type='raw')
+            day = parse_count_by_day(content, list(micro_ids))
+        except Exception as err:  # noqa: BLE001 - token expiry shows up as HTTP error or junk body
+            _LOGGER.info("micro_count_by_day failed (%s), logging in again and retrying", err)
+            self.login()
+            content = self._post_request(self.uris['micro_count_by_day'], payload=payload,
+                                         headers=dict(headers), response_type='raw')
+            day = parse_count_by_day(content, list(micro_ids))
+        return day
+
+    def module_count_by_day(self, sid, date, micro_id, ports, quotas=None):
+        """Per-panel (per-port) day series: DC power, voltage, current.
+
+        This endpoint answers with an EMPTY body when several quotas are asked
+        at once (unlike the microinverter one), so each quota is its own request
+        and the results are merged.
+        """
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/plain, */*"}
+        merged = None
+        for quota in quotas or MODULE_QUOTAS:
+            payload = {
+                "sid": sid,
+                "date": date,
+                "mi_list": [{"id": micro_id, "port": p} for p in ports],
+                "quota": [quota],
+                "pb_ver": 1,
+            }
+            try:
+                content = self._post_request(self.uris['module_count_by_day'], payload=payload,
+                                             headers=dict(headers), response_type='raw')
+                part = parse_module_count_by_day(content, date)
+            except Exception as err:  # noqa: BLE001 - expired token shows up as an error
+                _LOGGER.info("module_count_by_day failed (%s), logging in again and retrying", err)
+                self.login()
+                content = self._post_request(self.uris['module_count_by_day'], payload=payload,
+                                             headers=dict(headers), response_type='raw')
+                part = parse_module_count_by_day(content, date)
+            if not part.series:
+                _LOGGER.warning("Empty %s panel data for microinverter %s (%d bytes)",
+                                quota, micro_id, len(content or b""))
+            if merged is None:
+                merged = part
+            else:
+                if len(part.times) > len(merged.times):
+                    merged.times = part.times
+                for key, values in part.series.items():
+                    merged.series.setdefault(key, {}).update(values)
+                merged.quota_times.update(part.quota_times)
+        return merged
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def select_device_of_tree(self, station_id):
@@ -352,59 +515,3 @@ class HoymilesClient:
     # SYSTEM MAPPING AND DATA PROCESSING
     # ============================================================================
     
-
-    def map_system(self):
-        """Build a hierarchical system map of stations, microinverters, and modules."""
-        stations = self.select_by_page("station")
-        system = []
-        if not stations:
-            _LOGGER.warning("No stations found.")
-            return system
-        
-        for station_data in stations:
-            station = Station(station_data.get("id"), station_data.get("name"))
-            
-            # Fetch DTU information for the station
-            try:
-                tree_data = self.select_device_of_tree(station.station_id)
-                dtus = self.parse_dtu_info(tree_data)
-                station.set_dtus(dtus)
-                _LOGGER.debug(f"Found {len(dtus)} DTU(s) for station {station.station_id}")
-            except Exception as e:
-                _LOGGER.warning(f"Could not fetch DTU info for station {station.station_id}: {e}")
-            
-            # Fetch microinverters for the station
-            microinverters = self.select_by_station(station.station_id)
-            if not microinverters:
-                _LOGGER.warning(f"No microinverters found for station ID {station.station_id}.")
-                continue
-                
-            for micro_data in microinverters.get("list", []):
-                micro_id = micro_data.get("id")
-                sn = micro_data.get("sn")
-                microinverter = Microinverter(micro_id, sn)
-                station.add_microinverter(microinverter)
-                
-                # Fetch module details for each port
-                micro_details = self.micro_find(micro_id, station.station_id)
-                for port_info in micro_details.get("layout_list", []):
-                    module_id = f"{sn}-{port_info.get('port')}"
-                    port = port_info.get("port")
-                    x = port_info.get("x")
-                    y = port_info.get("y")
-                    solar_module = SolarModule(module_id, port, x, y)
-                    microinverter.add_module(solar_module)
-                    
-            system.append(station)
-        return system
-    
-    
-    def fill_system_data(self, system, date=None):
-        """Fill system hierarchy with actual performance data for a given date."""
-        if date is None:
-            date = datetime.datetime.now().strftime("%Y-%m-%d")
-        _LOGGER.debug(f"Filling system data for date: {date}")
-        for station in system:
-            sid = station.station_id
-            data = self.down_module_day_data(sid, date)
-            station.set_data(data)
