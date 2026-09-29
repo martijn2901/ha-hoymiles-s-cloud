@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-09-29
+
+### Fixed
+- Handle empty and malformed Hoymiles API data without crashing station sensors or caching failed responses.
+- Share station polling and serialize module refreshes to reduce duplicate API requests.
+- Mark readings unavailable during transient API failures instead of recording false zero values.
+- Stop logging credentials and authentication tokens; add request timeouts.
+
 ## [0.3.0] - 2026-03-23
 
 ### Added
