@@ -1,10 +1,14 @@
 # custom_components/hoymiles_cloud/sensor.py
 
+import asyncio
 import logging
+import time
+
+import requests
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfElectricPotential, UnitOfElectricCurrent
 
-from .hoymiles_client import HoymilesClient
+from .hoymiles_client import HoymilesResponseError
 from .device_registry import create_station_device_info, create_module_device_info
 
 DOMAIN = "hoymiles_nimbus"
@@ -13,31 +17,33 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class HoymilesSystemCoordinator:
-    """Coordinator to manage system data updates for all module sensors."""
-    
+    """Share one refresh across all module sensors."""
+
     def __init__(self, hass, client, initial_system):
         self._hass = hass
         self._client = client
         self._system = initial_system
-        self._last_update = None
-        
+        self._last_update = time.monotonic()
+        self._lock = asyncio.Lock()
+        self.available = True
+
     async def get_system(self):
-        """Get the current system data, updating if needed."""
-        import datetime
-        now = datetime.datetime.now()
-        
-        # Update every 30 seconds to avoid too frequent API calls
-        if (self._last_update is None or 
-            (now - self._last_update).total_seconds() > 30):
-            
-            self._system = await self._hass.async_add_executor_job(self._client.map_system)
-            await self._hass.async_add_executor_job(self._client.fill_system_data, self._system)
-            self._last_update = now
-            
-        return self._system
-    
+        async with self._lock:
+            if time.monotonic() - self._last_update >= 30:
+                # Wait before retrying a failed poll; keep the previous valid map.
+                self._last_update = time.monotonic()
+                try:
+                    system = await self._hass.async_add_executor_job(self._client.map_system)
+                    await self._hass.async_add_executor_job(self._client.fill_system_data, system)
+                except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
+                    self.available = False
+                    _LOGGER.warning("Hoymiles module data unavailable: %s", exc)
+                else:
+                    self._system = system
+                    self.available = True
+            return self._system if self.available else None
+
     def find_module(self, station_id, module_id):
-        """Find a specific module in the system."""
         for station in self._system:
             if station.station_id == station_id:
                 for microinverter in station.microinverters:
@@ -45,6 +51,33 @@ class HoymilesSystemCoordinator:
                         if module.id == module_id:
                             return module
         return None
+
+
+class HoymilesStationCoordinator:
+    """Poll a station once for its four sensors and share failures."""
+
+    def __init__(self, hass, client, station_id):
+        self._hass = hass
+        self._client = client
+        self._station_id = station_id
+        self._lock = asyncio.Lock()
+        self._last_update = 0.0
+        self._data = None
+
+    async def get_data(self):
+        async with self._lock:
+            if time.monotonic() - self._last_update >= 30:
+                self._last_update = time.monotonic()
+                try:
+                    response = await self._hass.async_add_executor_job(
+                        self._client.count_station_real_data, self._station_id
+                    )
+                except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
+                    _LOGGER.warning("Live data unavailable for station %s: %s", self._station_id, exc)
+                    self._data = None
+                else:
+                    self._data = response["data"]
+            return self._data
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
@@ -73,10 +106,11 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         device_info = create_station_device_info(sid, station_name)
         name = device_info["name"]
 
-        entities.append(HoymilesStationPowerSensor(client, name, sid, device_info))
-        entities.append(HoymilesStationEnergySensor(client, name, sid, device_info))
-        entities.append(HoymilesStationTotalEnergySensor(client, name, sid, device_info))
-        entities.append(HoymilesStationRatioSensor(client, name, sid, device_info))
+        station_coordinator = HoymilesStationCoordinator(hass, client, sid)
+        entities.append(HoymilesStationPowerSensor(station_coordinator, name, sid, device_info))
+        entities.append(HoymilesStationEnergySensor(station_coordinator, name, sid, device_info))
+        entities.append(HoymilesStationTotalEnergySensor(station_coordinator, name, sid, device_info))
+        entities.append(HoymilesStationRatioSensor(station_coordinator, name, sid, device_info))
 
     # Add individual solar module sensors
     for station in system:
@@ -99,137 +133,113 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     _LOGGER.warning("Created %d sensors for Hoymiles devices", len(entities))
     async_add_entities(entities)
 
-class HoymilesStationPowerSensor(SensorEntity):
-    def __init__(self, client, name, sid, device_info):
-        self._client = client
+class HoymilesStationSensor(SensorEntity):
+    """Common state handling for values from a station's live data."""
+
+    def __init__(self, coordinator, name, sid, device_info):
+        self._coordinator = coordinator
         self._sid = sid
+        self._attr_device_info = device_info
+        self._state = None
+
+    @property
+    def native_value(self):
+        return self._state
+
+    async def _read_data(self):
+        data = await self._coordinator.get_data()
+        self._attr_available = data is not None
+        if data is None:
+            self._state = None
+        return data
+
+    def _set_metric(self, data, key, scale=1):
+        value = data.get(key)
+        if value is None:
+            self._attr_available = False
+            self._state = None
+            return
+        try:
+            self._state = float(value) / scale
+        except (TypeError, ValueError):
+            self._attr_available = False
+            self._state = None
+            _LOGGER.warning("Invalid %s value for station %s", key, self._sid)
+
+
+class HoymilesStationPowerSensor(HoymilesStationSensor):
+    def __init__(self, coordinator, name, sid, device_info):
+        super().__init__(coordinator, name, sid, device_info)
         self._attr_name = f"{name} Current Power"
         self._attr_native_unit_of_measurement = UnitOfPower.WATT
         self._attr_unique_id = f"hoymiles_nimbus_{sid}_power"
         self._attr_device_class = "power"
-        self._attr_device_info = device_info
         self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._state = None
-
-    @property
-    def native_value(self):
-        return self._state
 
     async def async_update(self):
-        # _LOGGER.debug(f"Fetching current power for station {self._sid}")
-        
-        # Fetch the current power data from the Hoymiles S-Cloud
-        data = await self.hass.async_add_executor_job(self._client.count_station_real_data, self._sid)
-        # _LOGGER.debug(f"Received power data for station {self._sid}: {data}")
-        val = data.get("data", {}).get("real_power", 0)
-        if val is None:
-            _LOGGER.warning(f"Received None value for power data for station {self._sid}")
-            self._state = 0
-        else:
-            # _LOGGER.debug(f" Current power for station {self._sid}: {val}")
-            self._state = float(val)
-        
-class HoymilesStationEnergySensor(SensorEntity):
-    def __init__(self, client, name, sid, device_info):
-        self._client = client
-        self._sid = sid
+        if (data := await self._read_data()) is not None:
+            self._set_metric(data, "real_power")
+
+
+class HoymilesStationEnergySensor(HoymilesStationSensor):
+    def __init__(self, coordinator, name, sid, device_info):
+        super().__init__(coordinator, name, sid, device_info)
         self._attr_name = f"{name} Daily Energy"
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_unique_id = f"hoymiles_nimbus_{sid}_energy"
         self._attr_device_class = "energy"
-        self._attr_state_class = "total_increasing"
+        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_icon = "mdi:solar-power"
-        self._attr_device_info = device_info
-        self._state = None
-
-    @property
-    def native_value(self):
-        return self._state
 
     async def async_update(self):
-        data = await self.hass.async_add_executor_job(self._client.count_station_real_data, self._sid)
-        # _LOGGER.debug(f"Received energy data for station {self._sid}: {data}")
-        val = data.get("data", {}).get("today_eq", 0)
-        if val is None:
-            _LOGGER.warning(f"Received None value for energy data for station {self._sid}")
-            self._state = 0
-        else:
-            # _LOGGER.debug(f" Daily energy for station {self._sid}: {val}")
-            # Convert to kWh
-            # Assuming the value is in Wh, convert to kWh
-            self._state = float(val) / 1000
+        if (data := await self._read_data()) is not None:
+            self._set_metric(data, "today_eq", 1000)
 
-class HoymilesStationTotalEnergySensor(SensorEntity):
-    """Cumulative total energy sensor from lifetime production."""
-    
-    def __init__(self, client, name, sid, device_info):
-        self._client = client
-        self._sid = sid
+
+class HoymilesStationTotalEnergySensor(HoymilesStationSensor):
+    def __init__(self, coordinator, name, sid, device_info):
+        super().__init__(coordinator, name, sid, device_info)
         self._attr_name = f"{name} Total Energy"
         self._attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
         self._attr_unique_id = f"hoymiles_nimbus_{sid}_total_energy"
         self._attr_device_class = "energy"
         self._attr_state_class = SensorStateClass.TOTAL_INCREASING
         self._attr_icon = "mdi:solar-power"
-        self._attr_device_info = device_info
-        self._state = None
-
-    @property
-    def native_value(self):
-        return self._state
 
     async def async_update(self):
-        """Update the total energy from the API."""
-        data = await self.hass.async_add_executor_job(self._client.count_station_real_data, self._sid)
-        val = data.get("data", {}).get("total_eq", 0)
-        
-        if val is None:
-            _LOGGER.warning(f"Received None value for total energy data for station {self._sid}")
-            self._state = 0
-        else:
-            # Convert to kWh (assuming the value is in Wh like today_eq)
-            self._state = float(val) / 1000
+        if (data := await self._read_data()) is not None:
+            self._set_metric(data, "total_eq", 1000)
 
-class HoymilesStationRatioSensor(SensorEntity):
-    def __init__(self, client, name, sid, device_info):
-        self._client = client
-        self._sid = sid
+
+class HoymilesStationRatioSensor(HoymilesStationSensor):
+    def __init__(self, coordinator, name, sid, device_info):
+        super().__init__(coordinator, name, sid, device_info)
         self._attr_name = f"{name} Performance Ratio"
         self._attr_native_unit_of_measurement = "%"
         self._attr_unique_id = f"hoymiles_nimbus_{sid}_performance_ratio"
         self._attr_device_class = "performance_ratio"
-        self._attr_state_class = "measurement"
+        self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:percent"
-        self._attr_device_info = device_info
-        self._state = None
-
-    @property
-    def native_value(self):
-        return self._state
 
     async def async_update(self):
-        data = await self.hass.async_add_executor_job(self._client.count_station_real_data, self._sid)
-        capacity = data.get("data", {}).get("capacitor", 0)
-        current_power = data.get("data", {}).get("real_power", 0)
-
-        if capacity is None:
-            _LOGGER.warning(f"Received None value for capacity data for station {self._sid}")
-            self._state = 0
+        data = await self._read_data()
+        if data is None:
             return
-        if current_power is None:
-            _LOGGER.warning(f"Received None value for current power data for station {self._sid}")
-            self._state = 0
+        capacity = data.get("capacitor")
+        power = data.get("real_power")
+        if capacity is None or power is None:
+            self._state = None
+            self._attr_available = False
             return
-        if capacity == 0:
-            self._state = 0
-        else:
-            # Make sure we're dealing with floats
+        try:
             capacity = float(capacity)
-            current_power = float(current_power)
-            capacity_kw = capacity * 1000  # Convert kW to W
-            ratio = (current_power / capacity_kw) * 100
-            self._state = round(ratio, 2)
-        
+            power = float(power)
+            self._state = round(power / (capacity * 1000) * 100, 2) if capacity > 0 else 0
+        except (TypeError, ValueError):
+            self._state = None
+            self._attr_available = False
+            _LOGGER.warning("Invalid performance data for station %s", self._sid)
+
 
 class HoymilesSolarModulePowerSensor(SensorEntity):
     def __init__(self, coordinator, name, station_id, module, device_info):
@@ -267,7 +277,11 @@ class HoymilesSolarModulePowerSensor(SensorEntity):
 
     async def async_update(self):
         # Get updated system data through coordinator
-        system = await self._coordinator.get_system()
+        if await self._coordinator.get_system() is None:
+            self._attr_available = False
+            self._state = None
+            return
+        self._attr_available = True
         
         # Find our specific module in the updated system
         module = self._coordinator.find_module(self._station_id, self._module_id)
@@ -315,7 +329,11 @@ class HoymilesSolarModuleVoltageSensor(SensorEntity):
 
     async def async_update(self):
         # Get updated system data through coordinator
-        system = await self._coordinator.get_system()
+        if await self._coordinator.get_system() is None:
+            self._attr_available = False
+            self._state = None
+            return
+        self._attr_available = True
         
         # Find our specific module in the updated system
         module = self._coordinator.find_module(self._station_id, self._module_id)
@@ -366,7 +384,11 @@ class HoymilesSolarModuleCurrentSensor(SensorEntity):
 
     async def async_update(self):
         # Get updated system data through coordinator
-        system = await self._coordinator.get_system()
+        if await self._coordinator.get_system() is None:
+            self._attr_available = False
+            self._state = None
+            return
+        self._attr_available = True
         
         # Find our specific module in the updated system
         module = self._coordinator.find_module(self._station_id, self._module_id)

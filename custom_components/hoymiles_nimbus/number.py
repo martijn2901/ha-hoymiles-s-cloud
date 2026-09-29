@@ -1,8 +1,9 @@
 import logging
 from datetime import datetime, timedelta
+import requests
 from homeassistant.components.number import NumberEntity
 from homeassistant.const import CONF_SCAN_INTERVAL
-from .hoymiles_client import HoymilesClient
+from .hoymiles_client import HoymilesResponseError
 from .device_registry import create_station_device_info
 
 DOMAIN = "hoymiles_nimbus"
@@ -98,7 +99,13 @@ class HoymilesMicroInverterLevel(NumberEntity):
         
         _LOGGER.debug(f"[numbers] Updating power level for SID {self._sid}")
 
-        station = await self.hass.async_add_executor_job(self._client.findStation, self._sid)
+        try:
+            station = await self.hass.async_add_executor_job(self._client.findStation, self._sid)
+        except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
+            _LOGGER.warning("[numbers] Station %s unavailable: %s", self._sid, exc)
+            self._attr_available = False
+            return
+        self._attr_available = True
         if not station:
             _LOGGER.warning(f"[numbers] Station with SID {self._sid} not found")
             return
