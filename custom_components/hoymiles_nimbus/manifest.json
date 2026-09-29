@@ -1,12 +1,12 @@
 {
   "domain": "hoymiles_nimbus",
   "name": "Hoymiles Nimbus",
-  "version": "0.3.1",
-  "documentation": "https://github.com/wil-lem/ha-hoymiles-s-cloud",
-  "issue_tracker": "https://github.com/wil-lem/ha-hoymiles-s-cloud/issues",
+  "version": "0.3.2",
+  "documentation": "https://github.com/martijn2901/ha-hoymiles-s-cloud",
+  "issue_tracker": "https://github.com/martijn2901/ha-hoymiles-s-cloud/issues",
   "dependencies": [],
   "codeowners": [
-    "@wil-lem"
+    "@martijn2901"
   ],
   "requirements": [
     "requests>=2.25.0",

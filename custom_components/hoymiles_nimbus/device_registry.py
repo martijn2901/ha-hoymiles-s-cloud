@@ -26,13 +26,13 @@ def create_station_device_info(station_id: str, station_name: str = "Unknown") -
     }
 
 
-def create_module_device_info(module_id: str, station_device_identifier: str) -> dict:
+def create_module_device_info(module_id: str, station_device_id: str) -> dict:
     """
     Create consistent device info for a solar module.
     
     Args:
         module_id: The module ID from the API
-        station_device_identifier: The parent station device identifier
+        station_device_id: The parent station's Home Assistant device ID
         
     Returns:
         Dict containing device info for the module linked to its station
@@ -42,5 +42,5 @@ def create_module_device_info(module_id: str, station_device_identifier: str) ->
         "name": f"Solar Panel {module_id}",
         "manufacturer": "Hoymiles",
         "model": "Solar Module",
-        "via_device": (station_device_identifier,),
+        "via_device_id": station_device_id,
     }

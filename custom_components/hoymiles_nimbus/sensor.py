@@ -7,6 +7,7 @@ import time
 import requests
 from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.const import UnitOfPower, UnitOfEnergy, UnitOfElectricPotential, UnitOfElectricCurrent
+from homeassistant.helpers import device_registry as dr
 
 from .hoymiles_client import HoymilesResponseError
 from .device_registry import create_station_device_info, create_module_device_info
@@ -96,6 +97,8 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     _LOGGER.warning("Found %d station(s) in Hoymiles account", len(stations))
 
     entities = []
+    station_device_ids = {}
+    device_registry = dr.async_get(hass)
     
     # Create a shared system coordinator for all module sensors
     system_coordinator = HoymilesSystemCoordinator(hass, client, system)
@@ -105,6 +108,13 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
         sid = station.get("id")
         device_info = create_station_device_info(sid, station_name)
         name = device_info["name"]
+
+        # Register the station before its modules need the parent device ID.
+        # Reuse the existing identifier so established HA devices remain intact.
+        station_device = device_registry.async_get_or_create(
+            config_entry_id=config_entry.entry_id, **device_info
+        )
+        station_device_ids[sid] = station_device.id
 
         station_coordinator = HoymilesStationCoordinator(hass, client, sid)
         entities.append(HoymilesStationPowerSensor(station_coordinator, name, sid, device_info))
@@ -116,14 +126,17 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     for station in system:
         station_name = station.name
         sid = station.station_id
-        station_identifier = f"hoymiles_station_{station.station_id}"
+        station_device_id = station_device_ids.get(sid)
+        if station_device_id is None:
+            _LOGGER.warning("No registered station device for %s; skipping its modules", sid)
+            continue
 
         for microinverter in station.microinverters:
             for module in microinverter.modules:
                 module_name = f"{station_name} Panel {module.id}"
                 
                 # Create device info for the solar module
-                module_device_info = create_module_device_info(module.id, station_identifier)
+                module_device_info = create_module_device_info(module.id, station_device_id)
                 
                 # Add power, voltage, and current sensors for each module
                 entities.append(HoymilesSolarModulePowerSensor(system_coordinator, module_name, station.station_id, module, module_device_info))

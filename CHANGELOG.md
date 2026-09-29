@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-09-29
+
+### Fixed
+- Replace the deprecated module `via_device` link with the station's registered `via_device_id`.
+- Point integration documentation and issue reports to this fork.
+
 ## [0.3.1] - 2026-09-29
 
 ### Fixed
