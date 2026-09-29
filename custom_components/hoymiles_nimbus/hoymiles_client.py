@@ -22,6 +22,11 @@ _LOGGER = logging.getLogger(__name__)
 _CACHE_LOCK = threading.RLock()
 
 
+class HoymilesResponseError(ValueError):
+    """The cloud returned a response without the expected data."""
+
+
+
 class HoymilesClient:
     """
     Client for interacting with Hoymiles S-Cloud API.
@@ -78,14 +83,13 @@ class HoymilesClient:
                 raise Exception("Token is not set. Please authenticate first.")
 
         _LOGGER.debug(f"POST Request URL: {url}")
-        _LOGGER.debug(f"POST Request Payload: {payload}")
-        _LOGGER.debug(f"POST Request Headers: {headers}")
+        if uri != self.uris["login"]:
+            _LOGGER.debug("POST Request Payload: %s", payload)
         
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
         
         try:
             _LOGGER.debug(f"Response Status Code: {response.status_code}")
-            _LOGGER.debug(f"Response Headers: {response.headers}")
             response.raise_for_status()
             
             # Attempt to parse the response as JSON
@@ -95,7 +99,6 @@ class HoymilesClient:
                     _LOGGER.debug("API Response: %s - Protobuf data received", response.status_code)
                     return parser
                 response_data = response.json()
-                logging.debug(f"Response JSON: {response_data}")
                 _LOGGER.debug("API Response: %s - Success", response.status_code)
                 return response_data
             except ValueError:
@@ -123,21 +126,27 @@ class HoymilesClient:
 
         _LOGGER.debug(f"PUT Request URL: {url}")
         _LOGGER.debug(f"PUT Request Payload: {payload}")
-        _LOGGER.debug(f"PUT Request Headers: {headers}")
 
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=20)
         response.raise_for_status()
         
         # Attempt to parse the response as JSON
         try:
             response_data = response.json()
-            _LOGGER.debug(f"Response JSON: {response_data}")
             _LOGGER.debug("API Response: %s - Success", response.status_code)
             return response_data
         except ValueError:
             _LOGGER.error("Failed to parse response as JSON")
             _LOGGER.debug("API Response: %s - Failed to parse JSON", response.status_code)
             return None
+
+    @staticmethod
+    def _object_data(response, operation):
+        """Reject malformed API data so cachetools does not cache a failed poll."""
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, dict):
+            raise HoymilesResponseError(f"Invalid {operation} response from Hoymiles")
+        return data
 
     # ============================================================================
     # AUTHENTICATION METHODS
@@ -154,7 +163,6 @@ class HoymilesClient:
           "user_name": username,
           "password": password,
       }
-      _LOGGER.debug(f"Payload for get_token: {payload}")
       return self._post_request(self.uris['login'], payload=payload, use_auth=False)
     
 
@@ -185,7 +193,7 @@ class HoymilesClient:
         }
         response = self._post_request(self.uris['select_by_station'], payload=payload)
 
-        return response.get("data", {})
+        return self._object_data(response, "microinverter list")
     
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def micro_find(self, micro_id, station_id):
@@ -195,7 +203,7 @@ class HoymilesClient:
             "sid": station_id,
         }
         response = self._post_request(self.uris['micro_find'], payload=payload)
-        return response.get('data', {})
+        return self._object_data(response, "microinverter details")
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def module_details(self, station_id, micro_id, micro_sn, port, time):
@@ -210,7 +218,7 @@ class HoymilesClient:
         }
 
         response = self._post_request(self.uris['module_details'], payload=payload)
-        return response.get('data', {})
+        return self._object_data(response, "module details")
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def get_user_info(self):
@@ -237,25 +245,12 @@ class HoymilesClient:
         }
         response = self._post_request(uri, payload=payload)
 
-        if not isinstance(response, dict):
-            _LOGGER.warning(
-                "Unexpected response from Hoymiles station API: %r",
-                response,
-            )
-            return []
-        
-        data = response.get("data")
-        
-        if not isinstance(data, dict):
-            _LOGGER.warning(
-                "Unexpected station data format from Hoymiles API: %r",
-                data,
-            )
-            return []
-        
-        return data.get("list", [])
-        
-    
+        data = self._object_data(response, f"{type} list")
+        stations = data.get("list")
+        if not isinstance(stations, list):
+            raise HoymilesResponseError(f"Invalid {type} list from Hoymiles")
+        return stations
+
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def count_station_real_data(self,id):
         """Get the count of station real data."""
@@ -263,7 +258,9 @@ class HoymilesClient:
         payload = {
             "sid": id,
         }
-        return self._post_request(self.uris['count_station_data'], payload=payload)
+        response = self._post_request(self.uris['count_station_data'], payload=payload)
+        self._object_data(response, f"live data for station {id}")
+        return response
 
     @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def findStation(self, sid):
@@ -272,7 +269,7 @@ class HoymilesClient:
             "id": sid,
         }
         response = self._post_request(self.uris['find'], payload=payload)
-        return response.get('data', {})
+        return self._object_data(response, f"station {sid}")
 
     def down_module_day_data(self, sid, date):
         """Download module day data for a specific date."""
@@ -290,7 +287,10 @@ class HoymilesClient:
             "id": station_id,
         }
         response = self._post_request(self.uris['select_device_of_tree'], payload=payload)
-        return response.get('data', [])
+        data = response.get('data') if isinstance(response, dict) else None
+        if not isinstance(data, list):
+            raise HoymilesResponseError(f"Invalid device tree for station {station_id}")
+        return data
 
     def parse_dtu_info(self, tree_data):
         """Parse DTU information from select_device_of_tree response.
