@@ -4,6 +4,7 @@ import threading
 import yaml
 import logging
 import hashlib
+import time
 from cachetools import TTLCache, cached
 
 # Handle imports for both standalone and Home Assistant contexts
@@ -64,6 +65,9 @@ class HoymilesClient:
         }
         
         self.token = None
+        self._auth_lock = threading.RLock()
+        self._authenticated_at = 0.0
+        self._last_auth_retry = 0.0
         self.cache = TTLCache(maxsize=100, ttl=300)
 
     # ============================================================================
@@ -71,74 +75,61 @@ class HoymilesClient:
     # ============================================================================
 
 
-    def _post_request(self, uri, payload=None, headers=None, use_auth=True, binary=False, response_type='json'):
+    def _post_request(self, uri, payload=None, headers=None, use_auth=True, binary=False,
+                      response_type='json', retry_auth=True):
         """Helper method to make POST requests."""
         url = f"{self.base_url}{uri}"
-        if headers is None:
-            headers = {"Content-Type": "application/json"}
+        headers = dict(headers) if headers is not None else {"Content-Type": "application/json"}
         if use_auth:
-            if self.token:
-                headers["Authorization"] = self.token
-            else:
-                raise Exception("Token is not set. Please authenticate first.")
+            self._ensure_authenticated()
+            sent_token = self.token
+            headers["Authorization"] = sent_token
 
         _LOGGER.debug(f"POST Request URL: {url}")
         if uri != self.uris["login"]:
             _LOGGER.debug("POST Request Payload: %s", payload)
         
         response = requests.post(url, json=payload, headers=headers, timeout=20)
-        
-        try:
-            _LOGGER.debug(f"Response Status Code: {response.status_code}")
-            response.raise_for_status()
-            
-            # Attempt to parse the response as JSON
+        response.raise_for_status()
+        if response_type == 'protobuf' and binary:
             try:
-                if response_type == 'protobuf' and binary:
-                    parser = ProtobufParser(response.content)
-                    _LOGGER.debug("API Response: %s - Protobuf data received", response.status_code)
-                    return parser
-                response_data = response.json()
-                _LOGGER.debug("API Response: %s - Success", response.status_code)
-                return response_data
-            except ValueError:
-                logging.error("Failed to parse response as JSON")
-                _LOGGER.debug("API Response: %s - Failed to parse JSON", response.status_code)
-                return None
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Request failed: {e}")
-            _LOGGER.warning("API Response: Request failed - %s", str(e))
-            raise
-        except Exception as e:
-            logging.error(f"An unexpected error occurred: {e}")
-            _LOGGER.warning("API Response: Unexpected error - %s", str(e))
-            raise
+                return ProtobufParser(response.content)
+            except (ValueError, IndexError) as exc:
+                raise HoymilesResponseError("Invalid Hoymiles module day data") from exc
+        try:
+            response_data = response.json()
+        except ValueError as exc:
+            raise HoymilesResponseError("Invalid JSON from Hoymiles") from exc
+
+        # Hoymiles returned data="" on every endpoint exactly 24 hours after
+        # login in the supplied log. Retry once after refreshing the token.
+        if (use_auth and retry_auth and isinstance(response_data, dict)
+                and response_data.get("data") == ""
+                and self._refresh_expired_token(sent_token)):
+            return self._post_request(uri, payload, headers, use_auth, binary,
+                                      response_type, retry_auth=False)
+        return response_data
         
     def _put_request(self, uri, payload=None, headers=None):
         """Helper method to make PUT requests."""
-        url = f"{self.base_url}{uri}"
-        if headers is None:
-            headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = self.token
-        else:
-            raise Exception("Token is not set. Please authenticate first.")
+        return self._post_request(uri, payload=payload, headers=headers)
 
-        _LOGGER.debug(f"PUT Request URL: {url}")
-        _LOGGER.debug(f"PUT Request Payload: {payload}")
+    def _ensure_authenticated(self):
+        """Renew the shared session before its observed 24-hour expiry."""
+        with self._auth_lock:
+            if not self.token or time.monotonic() - self._authenticated_at >= 23 * 3600:
+                self.login(force=True)
 
-        response = requests.post(url, json=payload, headers=headers, timeout=20)
-        response.raise_for_status()
-        
-        # Attempt to parse the response as JSON
-        try:
-            response_data = response.json()
-            _LOGGER.debug("API Response: %s - Success", response.status_code)
-            return response_data
-        except ValueError:
-            _LOGGER.error("Failed to parse response as JSON")
-            _LOGGER.debug("API Response: %s - Failed to parse JSON", response.status_code)
-            return None
+    def _refresh_expired_token(self, sent_token):
+        """Let concurrent failed requests share one login, with a retry cooldown."""
+        with self._auth_lock:
+            if self.token != sent_token:
+                return True
+            if time.monotonic() - self._last_auth_retry < 300:
+                return False
+            self._last_auth_retry = time.monotonic()
+            self.login(force=True)
+            return True
 
     @staticmethod
     def _object_data(response, operation):
@@ -157,7 +148,6 @@ class HoymilesClient:
       passwordHash = hashlib.md5(password)
       return passwordHash.hexdigest()
 
-    @cached(cache=TTLCache(maxsize=100, ttl=300), lock=_CACHE_LOCK)
     def get_token(self,username, password):
       payload = {
           "user_name": username,
@@ -166,17 +156,21 @@ class HoymilesClient:
       return self._post_request(self.uris['login'], payload=payload, use_auth=False)
     
 
-    def login(self):
-      """Authenticate with Hoymiles S-Cloud and retrieve a token."""
-      _LOGGER.warning("Logging into Hoymiles S-Cloud for user: %s", self.username)
-      response_data = self.get_token(username=self.username, password=self.get_password_hash())
-      if response_data and "data" in response_data and "token" in response_data["data"]:
-          self.token = response_data["data"]["token"]
-          _LOGGER.warning("Successfully authenticated with Hoymiles S-Cloud")
-          return True
-      else:
-          _LOGGER.error("Login failed: Token not found in response")
-          raise Exception("Login failed: Token not found in response")
+    def login(self, force=False):
+        """Authenticate once per client, or renew a session that has expired."""
+        with self._auth_lock:
+            if self.token and not force:
+                return True
+            response_data = self.get_token(self.username, self.get_password_hash())
+            data = response_data.get("data") if isinstance(response_data, dict) else None
+            token = data.get("token") if isinstance(data, dict) else None
+            if not token:
+                raise HoymilesResponseError("Hoymiles authentication returned no token")
+            self.token = token
+            self._authenticated_at = time.monotonic()
+            self._last_auth_retry = self._authenticated_at
+            _LOGGER.info("Authenticated with Hoymiles S-Cloud")
+            return True
 
     # ============================================================================
     # DATA FETCHING METHODS

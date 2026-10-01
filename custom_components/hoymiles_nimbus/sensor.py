@@ -37,9 +37,12 @@ class HoymilesSystemCoordinator:
                     system = await self._hass.async_add_executor_job(self._client.map_system)
                     await self._hass.async_add_executor_job(self._client.fill_system_data, system)
                 except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
+                    if self.available:
+                        _LOGGER.warning("Hoymiles module data unavailable: %s", exc)
                     self.available = False
-                    _LOGGER.warning("Hoymiles module data unavailable: %s", exc)
                 else:
+                    if not self.available:
+                        _LOGGER.info("Hoymiles module data available again")
                     self._system = system
                     self.available = True
             return self._system if self.available else None
@@ -64,6 +67,7 @@ class HoymilesStationCoordinator:
         self._lock = asyncio.Lock()
         self._last_update = 0.0
         self._data = None
+        self._available = True
 
     async def get_data(self):
         async with self._lock:
@@ -74,10 +78,15 @@ class HoymilesStationCoordinator:
                         self._client.count_station_real_data, self._station_id
                     )
                 except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
-                    _LOGGER.warning("Live data unavailable for station %s: %s", self._station_id, exc)
+                    if self._available:
+                        _LOGGER.warning("Live data unavailable for station %s: %s", self._station_id, exc)
                     self._data = None
+                    self._available = False
                 else:
+                    if not self._available:
+                        _LOGGER.info("Live data available again for station %s", self._station_id)
                     self._data = response["data"]
+                    self._available = True
             return self._data
 
 

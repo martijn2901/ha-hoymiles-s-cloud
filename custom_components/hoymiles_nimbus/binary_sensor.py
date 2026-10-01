@@ -47,6 +47,7 @@ class HoymilesStationOnlineSensor(BinarySensorEntity):
         self._attr_icon = "mdi:lan-connect"
         self._state = None
         self._dtu_count = 0
+        self._attr_available = True
 
     @property
     def is_on(self):
@@ -83,6 +84,9 @@ class HoymilesStationOnlineSensor(BinarySensorEntity):
                     f"Fully online: {self._state}"
                 )
                 
+            self._attr_available = True
         except Exception as e:
-            _LOGGER.warning(f"Failed to update DTU status for station {self._sid}: {e}")
+            if self._attr_available:
+                _LOGGER.warning("Failed to update DTU status for station %s: %s", self._sid, e)
+            self._attr_available = False
             self._state = None

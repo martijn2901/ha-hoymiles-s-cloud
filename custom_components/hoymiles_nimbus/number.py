@@ -102,7 +102,8 @@ class HoymilesMicroInverterLevel(NumberEntity):
         try:
             station = await self.hass.async_add_executor_job(self._client.findStation, self._sid)
         except (HoymilesResponseError, requests.exceptions.RequestException) as exc:
-            _LOGGER.warning("[numbers] Station %s unavailable: %s", self._sid, exc)
+            if self._attr_available:
+                _LOGGER.warning("[numbers] Station %s unavailable: %s", self._sid, exc)
             self._attr_available = False
             return
         self._attr_available = True
@@ -121,6 +122,5 @@ class HoymilesMicroInverterLevel(NumberEntity):
             _LOGGER.warning(f"[numbers] No power level found for station with SID {self._sid}")
             return
         _LOGGER.debug(f"[numbers] Power level for station with SID {self._sid}: {power_level}")
-    
+
         self._attr_native_value = power_level
-        

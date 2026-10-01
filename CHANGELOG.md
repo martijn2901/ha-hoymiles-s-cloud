@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.3] - 2026-10-01
+
+### Fixed
+- Refresh the Hoymiles session before its observed 24-hour expiry and retry an empty response once after reauthentication.
+- Accept a new day's module response with no samples yet, and skip incomplete module records safely.
+- Log a cloud outage once per affected component instead of repeating the same warning every 30 seconds.
+
 ## [0.3.2] - 2026-09-29
 
 ### Fixed

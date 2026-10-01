@@ -25,18 +25,22 @@ class Station:
 
     def set_data(self, data):
         tree = data.get_compact()  # Store the day's data for the station
+        if not isinstance(tree, list) or len(tree) < 2:
+            _LOGGER.warning("Invalid day data for station ID %s", self.station_id)
+            return
         id = tree[0]
-        date = tree[1]
 
         if id != self.station_id:
             _LOGGER.warning("Data station ID %s does not match Station ID %s", id, self.station_id)
             return
         
-        if len(tree) < 3:
-            _LOGGER.warning("Data format for station ID %s is unexpected: %s", self.station_id, tree)
+        # A newly started day has a station ID and date, but no samples yet.
+        if len(tree) == 2:
             return
 
         for micro_data in tree[2:]:
+            if not isinstance(micro_data, list) or not micro_data:
+                continue
             micro_id = micro_data[0]
             micro_inverter = self.find_microinverter(micro_id)
             if not micro_inverter:
